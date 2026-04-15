@@ -36,12 +36,27 @@
 
 int main(int argc, char *argv[]) {
 
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <port_driver>\n", argv[0]);
+    int port;
+
+    if (argc == 2) {
+        port = atoi(argv[1]);
+    } else if (argc == 1) {
+        /* Auto-détection : lit le port depuis /tmp/ring_local (écrit par driver.c) */
+        FILE *fp = fopen("/tmp/ring_local", "r");
+        if (!fp) {
+            fprintf(stderr, "Erreur: driver non demarre (pas de /tmp/ring_local)\n");
+            fprintf(stderr, "Usage: %s <port_driver>\n", argv[0]);
+            exit(1);
+        }
+        if (fscanf(fp, "%d", &port) != 1) {
+            fclose(fp); fprintf(stderr, "Erreur lecture /tmp/ring_local\n"); exit(1);
+        }
+        fclose(fp);
+        printf("(port auto-detecte: %d)\n", port);
+    } else {
+        fprintf(stderr, "Usage: %s [port_driver]\n", argv[0]);
         exit(1);
     }
-
-    int port = atoi(argv[1]);   /* ID de cette machine = port du driver local */
 
     /* ==================================================================
        CONNEXION AU DRIVER — socket Unix AF_UNIX SOCK_STREAM
@@ -74,6 +89,13 @@ int main(int argc, char *argv[]) {
     fd_set readfds;
     int max_fd;
     msg_t msg;
+
+    /* ------------------------------------------------------------------
+       Table locale des machines — mise à jour automatique à chaque TABLE_UPDATE
+       Permet d'envoyer des messages par IP plutôt que par port
+       ------------------------------------------------------------------ */
+    machine_t local_table[MAX_MACHINES];
+    int local_nb = 0;
 
     /* ------------------------------------------------------------------
        Etat de réception de fichier (un seul transfert entrant à la fois)
@@ -116,13 +138,11 @@ int main(int argc, char *argv[]) {
                 printf("\n[BROADCAST de %d]: %s\n", msg.source, msg.data);
 
             } else if (msg.type == TABLE_UPDATE) {
-                /* Réponse au TABLE_REQ : désérialise et affiche la table */
-                machine_t t[MAX_MACHINES];
-                int nb = 0;
+                /* Met à jour la table locale et l'affiche */
                 char dummy[INET_ADDRSTRLEN];
-                table_deserialize(msg.data, t, &nb, dummy);
+                table_deserialize(msg.data, local_table, &local_nb, dummy);
                 printf("\n");
-                table_print(t, nb);
+                table_print(local_table, local_nb);
 
             /* ----------------------------------------------------------------
                Transfert de fichier entrant (poussé par le driver quand dest==moi)
@@ -170,13 +190,35 @@ int main(int argc, char *argv[]) {
 
             if (choix == 1) {
                 /* --------------------------------------------------------
-                   Emettre — envoie un TEXT vers une machine spécifique
-                   Le driver stocke le message et l'envoie au prochain token
+                   Emettre — envoie un TEXT vers une machine par IP
+                   Si la table locale est disponible : cherche le port par IP
+                   Sinon : saisie directe du port (fallback)
                    -------------------------------------------------------- */
-                int dest;
                 char texte[SMAX];
-                printf("Destination (port): ");
-                scanf("%d", &dest);
+                int dest = -1;
+
+                if (local_nb > 0) {
+                    char dest_ip[INET_ADDRSTRLEN];
+                    printf("Destination (IP): ");
+                    scanf("%s", dest_ip);
+                    /* Cherche le port correspondant dans la table locale */
+                    for (int i = 0; i < local_nb; i++) {
+                        if (strcmp(local_table[i].ip, dest_ip) == 0) {
+                            dest = local_table[i].port;
+                            break;
+                        }
+                    }
+                    if (dest == -1) {
+                        printf("Erreur: IP '%s' inconnue (faites Recuperer d'abord)\n",
+                               dest_ip);
+                        continue;
+                    }
+                    printf("(port %d)\n", dest);
+                } else {
+                    printf("Destination (port): ");
+                    scanf("%d", &dest);
+                }
+
                 printf("Message: ");
                 scanf(" %[^\n]", texte);
 
@@ -217,10 +259,29 @@ int main(int argc, char *argv[]) {
                    Le driver tient le token pendant tout le transfert (Token Ring)
                    msg.size dans FILE_START = taille totale du fichier
                    -------------------------------------------------------- */
-                int dest;
+                int dest = -1;
                 char filename[256];
-                printf("Destination (port): ");
-                scanf("%d", &dest);
+
+                if (local_nb > 0) {
+                    char dest_ip[INET_ADDRSTRLEN];
+                    printf("Destination (IP): ");
+                    scanf("%s", dest_ip);
+                    for (int i = 0; i < local_nb; i++) {
+                        if (strcmp(local_table[i].ip, dest_ip) == 0) {
+                            dest = local_table[i].port;
+                            break;
+                        }
+                    }
+                    if (dest == -1) {
+                        printf("Erreur: IP '%s' inconnue (faites Recuperer d'abord)\n",
+                               dest_ip);
+                        continue;
+                    }
+                    printf("(port %d)\n", dest);
+                } else {
+                    printf("Destination (port): ");
+                    scanf("%d", &dest);
+                }
                 printf("Fichier a envoyer: ");
                 scanf(" %255s", filename);
 

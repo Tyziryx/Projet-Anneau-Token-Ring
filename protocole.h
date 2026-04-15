@@ -36,6 +36,8 @@
 #define TABLE_REQ    11  /* Comm → Driver (unix) : "donne-moi la table"     */
 #define LEAVE_CMD    12  /* M_L → anneau : "je pars, voisin gauche reconnecte-toi" */
 #define LEAVE_DONE   13  /* M(n-1) → M_next... → M1 : "anneau rebouclé, retire port_L" */
+#define REPAIR_CMD   14  /* Mi → anneau : "Mj mort, M(j-1) reconnecte-toi à moi"   */
+#define REPAIR_DONE  15  /* M(j-1) → Mi : "reconnexion faite, anneau réparé"        */
 
 /* ------------------------------------------------------------------
    Format de TOUS les messages échangés (anneau ET socket unix)

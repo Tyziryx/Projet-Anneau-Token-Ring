@@ -41,6 +41,8 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/un.h>
+#include <ifaddrs.h>
+#include <time.h>
 
 #include "protocole.h"
 #include "utils.h"
@@ -78,20 +80,36 @@ int main(int argc, char *argv[]) {
        join_waiting : JOIN_CMD envoyé, on attend JOIN_DONE sur join_sock
        join_sock    : connexion de Mn → deviendra le nouveau sock_gauche
        ------------------------------------------------------------------ */
-    int  join_pending  = 0;
-    int  join_waiting  = 0;
-    int  join_sock     = -1;
-    char join_ip[INET_ADDRSTRLEN]    = {0};
-    char join_hostname[HOSTNAME_LEN] = {0};
-    int  join_port     = -1;
+    int    join_pending  = 0;
+    int    join_waiting  = 0;
+    int    join_sock     = -1;
+    char   join_ip[INET_ADDRSTRLEN]    = {0};
+    char   join_hostname[HOSTNAME_LEN] = {0};
+    int    join_port     = -1;
+    time_t join_start    = 0;     /* timestamp du début du join — pour timeout 10s */
 
-    /* Récupère l'IP et le hostname de cette machine */
+    /* Récupère le hostname */
     char tmp_host[256];
     gethostname(tmp_host, sizeof(tmp_host));
     strncpy(self_hostname, tmp_host, HOSTNAME_LEN - 1);
-    struct hostent *hp = gethostbyname(tmp_host);
-    if (hp) inet_ntop(AF_INET, hp->h_addr_list[0], self_ip, sizeof(self_ip));
-    else    strcpy(self_ip, "127.0.0.1");
+
+    /* Récupère la vraie IP réseau via getifaddrs (évite 127.0.1.1 sur Ubuntu)
+       On prend la première interface non-loopback avec une adresse IPv4 */
+    struct ifaddrs *ifas, *ifa;
+    if (getifaddrs(&ifas) == 0) {
+        for (ifa = ifas; ifa; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+            struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+            char buf[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf));
+            if (strncmp(buf, "127.", 4) != 0) {   /* ignore loopback */
+                strncpy(self_ip, buf, INET_ADDRSTRLEN - 1);
+                break;
+            }
+        }
+        freeifaddrs(ifas);
+    }
+    if (self_ip[0] == '\0') strcpy(self_ip, "127.0.0.1");
 
     printf("===== DRIVER ANNEAU =====\n");
     printf("1. Creer anneau (premier PC)\n");
@@ -115,8 +133,10 @@ int main(int argc, char *argv[]) {
         /* M1 s'ajoute à sa propre table (is_master=1) */
         table_add(table, &nb_machines, port_ecoute, self_ip, self_hostname, 1);
 
-        server_sock = socket_create_server(port_ecoute);
-        if (server_sock < 0) FATAL("socket_create_server");
+        while ((server_sock = socket_create_server(port_ecoute)) < 0) {
+            printf("Port %d deja utilise. Choisissez un autre port: ", port_ecoute);
+            scanf("%d", &port_ecoute);
+        }
 
         printf("En attente du premier voisin...\n");
 
@@ -127,9 +147,11 @@ int main(int argc, char *argv[]) {
         if (sock_gauche < 0) FATAL("accept");
         printf("Connexion recue !\n");
 
-        /* Handshake : M2 envoie son port puis son hostname */
+        /* Handshake : M2 envoie flag 'J' + port + hostname */
         int port_m2;
         char hostname_m2[HOSTNAME_LEN];
+        char iflag;
+        if (recv_all(sock_gauche, &iflag, 1) <= 0) FATAL("recv flag init");
         if (recv_all(sock_gauche, (char *)&port_m2, sizeof(int)) <= 0)
             FATAL("recv port_m2");
         port_m2 = ntohl(port_m2);
@@ -182,14 +204,19 @@ int main(int argc, char *argv[]) {
 
         /* Étape 1 : créer le server AVANT d'envoyer le port à M1
            → M1 ne peut pas lancer JOIN_CMD avant que notre server soit prêt */
-        server_sock = socket_create_server(port_ecoute);
-        if (server_sock < 0) FATAL("socket_create_server");
+        while ((server_sock = socket_create_server(port_ecoute)) < 0) {
+            printf("Port %d deja utilise. Choisissez un autre port: ", port_ecoute);
+            scanf("%d", &port_ecoute);
+        }
 
         /* Étape 2 : connexion vers M1 (ce socket deviendra sock_droite) */
         sock_droite = socket_create_inet(ip_m1, port_m1);
         if (sock_droite < 0) FATAL("socket_create_inet");
 
-        /* Étape 3 : handshake → envoie port puis hostname à M1 */
+        /* Étape 3 : handshake → flag 'J' + port + hostname à M1
+           Le flag permet à M1 de distinguer un JOIN d'une reconnexion LEAVE */
+        char jflag = 'J';
+        if (send_all(sock_droite, &jflag, 1) <= 0) FATAL("send flag");
         int port_net = htonl(port_ecoute);
         if (send_all(sock_droite, &port_net, sizeof(int)) <= 0)
             FATAL("send port_ecoute");
@@ -235,6 +262,10 @@ int main(int argc, char *argv[]) {
     int unix_listen = socket_create_unix_server(unix_path);
     if (unix_listen < 0) FATAL("socket_create_unix_server");
     printf("[UNIX] En attente de Comm sur %s\n", unix_path);
+
+    /* Ecrit le port dans /tmp/ring_local → comm peut s'y connecter sans argument */
+    { FILE *fp = fopen("/tmp/ring_local", "w");
+      if (fp) { fprintf(fp, "%d", port_ecoute); fclose(fp); } }
 
     /* Seul M1 génère le token initial (un seul token dans l'anneau)
        seq=1 : premier token, les tokens avec seq < token_seq seront absorbes */
@@ -302,14 +333,23 @@ int main(int argc, char *argv[]) {
         }
 
         /* M1 : timeout pour détecter token perdu (N*3 secondes)
-           Pas de timeout pendant un join (token intentionnellement bloqué)
-           Si activity==0 → token perdu → M1 régénère avec seq incrémenté */
+           Pendant join_waiting : timeout 10s pour détecter JOIN_DONE jamais reçu
+           Si activity==0 → token perdu ou join bloqué → action corrective */
         struct timeval  tv;
         struct timeval *ptv = NULL;
-        if (choix == 1 && !join_waiting) {
-            int n_sec = (nb_machines > 1 ? nb_machines : 2) * 3;
-            tv.tv_sec  = n_sec;
-            tv.tv_usec = 0;
+        if (choix == 1) {
+            if (join_waiting) {
+                /* Timeout join : combien de temps reste-t-il avant les 10s ? */
+                time_t elapsed = time(NULL) - join_start;
+                long remaining = 10 - (long)elapsed;
+                if (remaining <= 0) remaining = 1;
+                tv.tv_sec  = remaining;
+                tv.tv_usec = 0;
+            } else {
+                int n_sec = (nb_machines > 1 ? nb_machines : 2) * 3;
+                tv.tv_sec  = n_sec;
+                tv.tv_usec = 0;
+            }
             ptv = &tv;
         }
 
@@ -317,17 +357,29 @@ int main(int argc, char *argv[]) {
         if (activity < 0) { perror("select"); break; }
 
         /* ----------------------------------------------------------------
-           Timeout M1 : token perdu ou bloqué quelque part
-           Régénère un nouveau token avec un seq plus élevé
-           L'éventuel ancien token sera absorbé à son retour (seq < token_seq)
+           Timeout M1
+           - join_waiting : JOIN_DONE pas reçu dans les 10s → rollback
+           - sinon : token perdu → régénérer
            ---------------------------------------------------------------- */
         if (activity == 0) {
-            token_seq++;
-            msg_t token = create_msg_TOKEN(port_ecoute, -1);
-            token.size = token_seq;
-            send_msg_t(sock_droite, &token);
-            printf("[TOKEN] Timeout — token regenere (seq=%d, %d machines)\n",
-                   token_seq, nb_machines);
+            if (choix == 1 && join_waiting) {
+                /* Rollback join : ferme join_sock, relance le token */
+                printf("[JOIN] Timeout — JOIN_DONE non recu, rollback\n");
+                close(join_sock); join_sock = -1;
+                join_pending = 0; join_waiting = 0;
+                msg_t token = create_msg_TOKEN(port_ecoute, -1);
+                token.size = ++token_seq;
+                send_msg_t(sock_droite, &token);
+                printf("[TOKEN] Token relance apres rollback join (seq=%d)\n",
+                       token_seq);
+            } else {
+                token_seq++;
+                msg_t token = create_msg_TOKEN(port_ecoute, -1);
+                token.size = token_seq;
+                send_msg_t(sock_droite, &token);
+                printf("[TOKEN] Timeout — token regenere (seq=%d, %d machines)\n",
+                       token_seq, nb_machines);
+            }
             continue;
         }
 
@@ -337,6 +389,20 @@ int main(int argc, char *argv[]) {
         if (FD_ISSET(unix_listen, &readfds)) {
             unix_client = accept(unix_listen, NULL, NULL);
             printf("[UNIX] Comm connecte\n");
+            /* Pousse immédiatement la table courante vers comm
+               → comm affiche l'état du ring sans que l'utilisateur
+               ait besoin de faire "3. Récupérer" manuellement */
+            if (nb_machines > 0) {
+                msg_t tresp;
+                tresp.type   = TABLE_UPDATE;
+                tresp.source = port_ecoute;
+                tresp.dest   = -1;
+                tresp.size   = table_serialize(table, nb_machines,
+                                               self_ip, tresp.data);
+                send_msg_t(unix_client, &tresp);
+                printf("[UNIX] Table poussee vers comm (%d machines)\n",
+                       nb_machines);
+            }
         }
 
         /* ----------------------------------------------------------------
@@ -380,75 +446,105 @@ int main(int argc, char *argv[]) {
                                                self_ip, tresp.data);
                 send_msg_t(unix_client, &tresp);
             } else {
-                /* Stocke le message, sera envoyé quand le token passe */
-                has_pending = 1;
-                printf("[UNIX] Message en attente du token (dest=%d)\n",
-                       pending_msg.dest);
+                if (has_pending) {
+                    /* Refuse : un message est déjà en file d'attente */
+                    printf("[UNIX] Refuse — message deja en attente (dest=%d)\n",
+                           pending_msg.dest);
+                    /* Notifie comm pour qu'il puisse afficher un message d'erreur */
+                    msg_t err;
+                    err.type   = TEXT;
+                    err.source = port_ecoute;
+                    err.dest   = port_ecoute;
+                    err.size   = snprintf(err.data, SMAX,
+                        "[ERREUR] Un message est deja en attente du token, reessayez");
+                    send_msg_t(unix_client, &err);
+                } else {
+                    /* Stocke le message, sera envoyé quand le token passe */
+                    has_pending = 1;
+                    printf("[UNIX] Message en attente du token (dest=%d)\n",
+                           pending_msg.dest);
+                }
             }
         }
 
         /* ----------------------------------------------------------------
-           M1 : nouvelle machine Mn veut rejoindre l'anneau
-           Protocole :
-             1. accept sur server_sock → join_sock
-             2. reçoit port + hostname de Mn
-             3. envoie la table courante à Mn (elle recevra son IP propre)
-             4. passe join_pending=1 → sera traité au prochain TOKEN
-           → Extraire en handle_join_request() si le code grossit
+           Nouvelle connexion sur server_sock — JOIN ou reconnexion LEAVE
+           Premier byte = flag : 'J' → nouveau membre  'L' → reconnexion LEAVE
+           Sans ce flag, M1 lisait type=LEAVE_DONE(13) comme port → garbage
+           Pattern repris de td5/serveur.c : accept → recv → dispatch
            ---------------------------------------------------------------- */
         if (!join_waiting && !has_leaving && FD_ISSET(server_sock, &readfds)) {
-
-        /* ----------------------------------------------------------------
-           Reconnexion LEAVE — M(n-1) se reconnecte à cette machine après
-           le départ du voisin gauche (M_L). Valable pour TOUS les drivers.
-           Repris du pattern td5/serveur.c : accept → recv → close ancien
-           ---------------------------------------------------------------- */
-        if (choix != 1) {
-            int new_gauche = accept(server_sock, NULL, NULL);
-            if (new_gauche >= 0) {
-                msg_t ldone;
-                if (recv_msg_t(new_gauche, &ldone) > 0 && ldone.type == LEAVE_DONE) {
-                    printf("[LEAVE] Nouveau voisin gauche (port=%d), remplacement\n",
-                           ldone.source);
-                    close(sock_gauche);    /* ferme l'ancienne connexion vers M_L */
-                    sock_gauche = new_gauche;
-                    /* Forward LEAVE_DONE vers M1 pour mettre à jour la table */
-                    send_msg_t(sock_droite, &ldone);
+            struct sockaddr_in scli;
+            socklen_t slg = sizeof(scli);
+            int new_sock = accept(server_sock, (struct sockaddr *)&scli, &slg);
+            if (new_sock >= 0) {
+                char conn_flag;
+                if (recv_all(new_sock, &conn_flag, 1) <= 0) {
+                    close(new_sock);
+                } else if (conn_flag == 'L') {
+                    /* Reconnexion LEAVE : M(n-1) devient le nouveau voisin gauche */
+                    msg_t ldone;
+                    if (recv_msg_t(new_sock, &ldone) > 0 && ldone.type == LEAVE_DONE) {
+                        printf("[LEAVE] Nouveau voisin gauche (port=%d)\n", ldone.source);
+                        close(sock_gauche);
+                        sock_gauche = new_sock;
+                        if (choix == 1) {
+                            /* M1 est M_next : traite directement sans passer par l'anneau */
+                            int leaving_port = ldone.dest;
+                            table_remove(table, &nb_machines, leaving_port);
+                            for (int i = 0; i < nb_machines; i++) {
+                                if (table[i].port == port_ecoute) {
+                                    table[i].port_s = port_voisin_droite; break;
+                                }
+                            }
+                            table_print(table, nb_machines);
+                            printf("[LEAVE_DONE] Machine %d retiree\n", leaving_port);
+                            msg_t tupd;
+                            tupd.type   = TABLE_UPDATE;
+                            tupd.source = port_ecoute;
+                            tupd.dest   = -1;
+                            tupd.size   = table_serialize(table, nb_machines,
+                                                          self_ip, tupd.data);
+                            send_msg_t(sock_droite, &tupd);
+                            msg_t tok = create_msg_TOKEN(port_ecoute, -1);
+                            tok.size = ++token_seq;
+                            send_msg_t(sock_droite, &tok);
+                            printf("[TOKEN] Token relance apres depart (seq=%d)\n",
+                                   token_seq);
+                        } else {
+                            /* Non-M1 : forward LEAVE_DONE vers M1 via l'anneau */
+                            send_msg_t(sock_droite, &ldone);
+                        }
+                    } else {
+                        close(new_sock);
+                    }
+                } else if (conn_flag == 'J' && choix == 1) {
+                    /* JOIN : nouvelle machine — M1 uniquement */
+                    join_sock = new_sock;
+                    inet_ntop(AF_INET, &scli.sin_addr, join_ip, sizeof(join_ip));
+                    int jport_net;
+                    if (recv_all(join_sock, (char *)&jport_net, sizeof(int)) <= 0
+                     || recv_all(join_sock, join_hostname, HOSTNAME_LEN) <= 0) {
+                        close(join_sock); join_sock = -1;
+                    } else {
+                        join_port = ntohl(jport_net);
+                        msg_t tmsg;
+                        tmsg.type   = TABLE_UPDATE;
+                        tmsg.source = port_ecoute;
+                        tmsg.dest   = join_port;
+                        tmsg.size   = table_serialize(table, nb_machines,
+                                                      join_ip, tmsg.data);
+                        send_msg_t(join_sock, &tmsg);
+                        join_pending = 1;
+                        join_start   = time(NULL);
+                        printf("[JOIN] %s (%s:%d) veut rejoindre — attente token\n",
+                               join_hostname, join_ip, join_port);
+                    }
                 } else {
-                    close(new_gauche);     /* connexion inattendue, ignore */
-                }
-            }
-        } else if (choix == 1 && FD_ISSET(server_sock, &readfds)) {
-            struct sockaddr_in jcli;
-            socklen_t jlg = sizeof(jcli);
-            join_sock = accept(server_sock, (struct sockaddr *)&jcli, &jlg);
-            if (join_sock < 0) {
-                perror("accept join");
-            } else {
-                int jport_net;
-                if (recv_all(join_sock, (char *)&jport_net, sizeof(int)) <= 0
-                 || recv_all(join_sock, join_hostname, HOSTNAME_LEN) <= 0) {
-                    close(join_sock); join_sock = -1;
-                } else {
-                    join_port = ntohl(jport_net);
-                    inet_ntop(AF_INET, &jcli.sin_addr, join_ip, sizeof(join_ip));
-
-                    /* Envoie la table à Mn (sans Mn dedans, sera ajouté après JOIN_DONE) */
-                    msg_t tmsg;
-                    tmsg.type   = TABLE_UPDATE;
-                    tmsg.source = port_ecoute;
-                    tmsg.dest   = join_port;
-                    tmsg.size   = table_serialize(table, nb_machines,
-                                                   join_ip, tmsg.data);
-                    send_msg_t(join_sock, &tmsg);
-
-                    join_pending = 1;
-                    printf("[JOIN] %s (%s:%d) veut rejoindre — attente token\n",
-                           join_hostname, join_ip, join_port);
+                    close(new_sock);
                 }
             }
         }
-        } /* fin du bloc if (!join_waiting && !has_leaving && FD_ISSET(server_sock)) */
 
         /* ----------------------------------------------------------------
            M1 : reçoit JOIN_DONE sur join_sock → finalise le join
@@ -504,18 +600,62 @@ int main(int argc, char *argv[]) {
             int n = recv_msg_t(sock_gauche, &msg);
             if (n <= 0) {
                 /* Déconnexion du voisin gauche.
-                   Repris de td5/serveur.c : n<=0 = connexion fermée
-                   3 cas :
                    1. join en cours → M(n-1) a fermé volontairement, normal
-                   2. has_leaving → c'est MOI qui pars, M(n-1) m'a déconnecté → sortie propre
-                   3. sinon → déconnexion inattendue (TODO: élection/réparation) */
+                   2. has_leaving → c'est MOI qui pars → sortie propre
+                   3. sinon → déconnexion brutale → lancer REPAIR */
                 if (join_waiting) continue;
                 if (has_leaving) {
                     printf("[LEAVE] Deconnexion confirmee par M(n-1), sortie propre\n");
-                    break;   /* → nettoyage final en bas de main() */
+                    break;
                 }
-                printf("Voisin gauche deconnecte (inattendu)\n");
-                break;
+                /* Déconnexion brutale : on cherche quel port est mort.
+                   Le voisin gauche mort = celui dont port_s == port_ecoute dans la table
+                   (il avait port_ecoute comme voisin droit = nous).
+                   On envoie REPAIR_CMD sur sock_droite : data = "ip_moi port_moi port_mort" */
+                int dead_port = -1;
+                for (int i = 0; i < nb_machines; i++) {
+                    if (table[i].port_s == port_ecoute && table[i].port != port_ecoute) {
+                        dead_port = table[i].port; break;
+                    }
+                }
+                printf("[REPAIR] Voisin gauche mort (port=%d) — envoi REPAIR_CMD\n",
+                       dead_port);
+                close(sock_gauche); sock_gauche = -1;
+                /* Ouvre server_sock pour recevoir la reconnexion de M(j-1) */
+                msg_t rcmd;
+                rcmd.type   = REPAIR_CMD;
+                rcmd.source = port_ecoute;
+                rcmd.dest   = -1;
+                rcmd.size   = snprintf(rcmd.data, SMAX, "%s %d %d",
+                                       self_ip, port_ecoute, dead_port);
+                send_msg_t(sock_droite, &rcmd);
+                /* Attend la reconnexion de M(j-1) sur server_sock */
+                printf("[REPAIR] Attente reconnexion sur port %d...\n", port_ecoute);
+                struct sockaddr_in rcli; socklen_t rlg = sizeof(rcli);
+                sock_gauche = accept(server_sock, (struct sockaddr *)&rcli, &rlg);
+                if (sock_gauche < 0) { perror("accept repair"); break; }
+                /* Lit le flag de connexion puis REPAIR_DONE */
+                char rflag;
+                msg_t rdone;
+                recv_all(sock_gauche, &rflag, 1);
+                recv_msg_t(sock_gauche, &rdone);
+                /* M1 retire la machine morte et diffuse la table mise à jour */
+                if (dead_port > 0) {
+                    table_remove(table, &nb_machines, dead_port);
+                    table_print(table, nb_machines);
+                }
+                if (choix == 1) {
+                    msg_t tupd;
+                    tupd.type   = TABLE_UPDATE;
+                    tupd.source = port_ecoute; tupd.dest = -1;
+                    tupd.size   = table_serialize(table, nb_machines, self_ip, tupd.data);
+                    send_msg_t(sock_droite, &tupd);
+                    msg_t tok = create_msg_TOKEN(port_ecoute, -1);
+                    tok.size = ++token_seq;
+                    send_msg_t(sock_droite, &tok);
+                    printf("[REPAIR] Anneau repare, token relance (seq=%d)\n", token_seq);
+                }
+                continue;
             }
 
             /* ------------------------------------------------------------
@@ -661,6 +801,11 @@ int main(int argc, char *argv[]) {
                     port_voisin_droite = port_next;
                     strcpy(ip_voisin_droite, ip_next);
 
+                    /* Envoie flag 'L' avant LEAVE_DONE pour que M_next distingue
+                       cette connexion d'un JOIN (correction du bug port=218103808) */
+                    char lflag = 'L';
+                    send_all(sock_droite, &lflag, 1);
+
                     /* LEAVE_DONE : msg.dest = port_L (pour que M1 retire de table) */
                     msg_t done;
                     done.type   = LEAVE_DONE;
@@ -717,12 +862,12 @@ int main(int argc, char *argv[]) {
             } else if (msg.type == TABLE_UPDATE) {
 
                 if (msg.source == port_ecoute) {
-                    /* Tour complet : la table contient maintenant les port_s de toutes
-                       les machines (chacune a rempli le sien avant de forwarder).
-                       On met à jour la table locale avec cette version enrichie. */
+                    /* Tour complet : met à jour la table locale avec les port_s */
                     char dummy[INET_ADDRSTRLEN];
                     table_deserialize(msg.data, table, &nb_machines, dummy);
-                    printf("[TABLE] Tour complet, absorbe (table a jour avec port_s)\n");
+                    printf("[TABLE] Tour complet, absorbe\n");
+                    /* Notifie comm de la mise à jour */
+                    if (unix_client > 0) send_msg_t(unix_client, &msg);
                 } else {
                     char dummy[INET_ADDRSTRLEN];
                     table_deserialize(msg.data, table, &nb_machines, dummy);
@@ -793,6 +938,49 @@ int main(int argc, char *argv[]) {
                 } else {
                     send_msg_t(sock_droite, &msg);
                 }
+
+            /* ------------------------------------------------------------
+               REPAIR_CMD — un voisin droit Mi signale que Mj (son voisin gauche) est mort
+               data = "ip_Mi port_Mi port_mort"
+               Si port_voisin_droite == port_mort → je suis M(j-1), je me reconnecte à Mi
+               Sinon → forward
+               ------------------------------------------------------------ */
+            } else if (msg.type == REPAIR_CMD) {
+                char ip_mi[INET_ADDRSTRLEN]; int port_mi, port_mort;
+                sscanf(msg.data, "%s %d %d", ip_mi, &port_mi, &port_mort);
+
+                if (port_voisin_droite == port_mort) {
+                    /* Je suis M(j-1) : mon voisin droit est mort */
+                    printf("[REPAIR_CMD] Mon voisin droit %d est mort — reconnexion vers %s:%d\n",
+                           port_mort, ip_mi, port_mi);
+                    close(sock_droite);
+                    sock_droite = socket_create_inet(ip_mi, port_mi);
+                    if (sock_droite < 0) FATAL("socket_create_inet repair");
+                    port_voisin_droite = port_mi;
+                    strcpy(ip_voisin_droite, ip_mi);
+                    /* Envoie flag 'R' + REPAIR_DONE */
+                    char rflag = 'R';
+                    send_all(sock_droite, &rflag, 1);
+                    msg_t rdone;
+                    rdone.type   = REPAIR_DONE;
+                    rdone.source = port_ecoute;
+                    rdone.dest   = port_mort;   /* port de la machine morte */
+                    rdone.size   = 0;
+                    rdone.data[0] = '\0';
+                    send_msg_t(sock_droite, &rdone);
+                    printf("[REPAIR_CMD] REPAIR_DONE envoye\n");
+                } else {
+                    send_msg_t(sock_droite, &msg);
+                }
+
+            /* ------------------------------------------------------------
+               REPAIR_DONE — anneau réparé, forward jusqu'à Mi (déjà traité
+               dans le handler accept + boucle repair au-dessus)
+               ------------------------------------------------------------ */
+            } else if (msg.type == REPAIR_DONE) {
+                /* Normalement absorbé par Mi dans le accept() bloquant ci-dessus.
+                   Si on arrive ici c'est un forward d'une machine intermédiaire. */
+                send_msg_t(sock_droite, &msg);
             }
         }
     }
