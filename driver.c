@@ -693,13 +693,22 @@ int main(int argc, char *argv[]) {
                     recv_all(sock_gauche, &rflag, 1);
                     recv_msg_t(sock_gauche, &rdone);
                     if (dead_port > 0) table_remove(table, &nb_machines, dead_port);
+                    /* Remplit son propre port_s dans la table réparée */
+                    for (int i = 0; i < nb_machines; i++) {
+                        if (table[i].port == port_ecoute) {
+                            table[i].port_s = port_voisin_droite; break;
+                        }
+                    }
                     table_print(table, nb_machines);
+                    /* Tous envoient TABLE_UPDATE (même non-M1) pour propager la table
+                       sans la machine morte. Le token sera régénéré par M1 (timeout)
+                       ou relancé directement si c'est M1 qui répare. */
+                    msg_t tupd;
+                    tupd.type   = TABLE_UPDATE;
+                    tupd.source = port_ecoute; tupd.dest = -1;
+                    tupd.size   = table_serialize(table, nb_machines, self_ip, tupd.data);
+                    send_msg_t(sock_droite, &tupd);
                     if (choix == 1) {
-                        msg_t tupd;
-                        tupd.type   = TABLE_UPDATE;
-                        tupd.source = port_ecoute; tupd.dest = -1;
-                        tupd.size   = table_serialize(table, nb_machines, self_ip, tupd.data);
-                        send_msg_t(sock_droite, &tupd);
                         msg_t tok = create_msg_TOKEN(port_ecoute, -1);
                         tok.size = ++token_seq;
                         send_msg_t(sock_droite, &tok);
