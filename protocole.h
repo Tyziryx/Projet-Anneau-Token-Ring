@@ -38,6 +38,7 @@
 #define LEAVE_DONE   13  /* M(n-1) → M_next... → M1 : "anneau rebouclé, retire port_L" */
 #define REPAIR_CMD   14  /* Mi → anneau : "Mj mort, M(j-1) reconnecte-toi à moi"   */
 #define REPAIR_DONE  15  /* M(j-1) → Mi : "reconnexion faite, anneau réparé"        */
+#define ELECTION     16  /* M2 → anneau : "M1 mort, je suis nouveau maître"         */
 
 /* ------------------------------------------------------------------
    Format de TOUS les messages échangés (anneau ET socket unix)
