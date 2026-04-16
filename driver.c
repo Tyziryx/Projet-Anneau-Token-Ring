@@ -73,6 +73,7 @@ int main(int argc, char *argv[]) {
        ------------------------------------------------------------------ */
     int token_seq  = 0;
     int has_leaving = 0;    /* 1 = cette machine est en train de quitter l'anneau */
+    int election_pending = 0; /* 1 = ELECTION envoye, on attend la reco de Mn en 'E' */
 
     /* ------------------------------------------------------------------
        Variables de join — utilisées par M1 uniquement
@@ -343,7 +344,9 @@ int main(int argc, char *argv[]) {
            Si activity==0 → token perdu ou join bloqué → action corrective */
         struct timeval  tv;
         struct timeval *ptv = NULL;
-        if (choix == 1) {
+        if (choix == 1 && !election_pending) {
+            /* Pendant election_pending : pas de timeout token
+               (sock_gauche est a -1, relancer le token n'a aucun sens) */
             if (join_waiting) {
                 /* Timeout join : combien de temps reste-t-il avant les 10s ? */
                 time_t elapsed = time(NULL) - join_start;
@@ -544,6 +547,7 @@ int main(int argc, char *argv[]) {
                     msg_t elec;
                     if (recv_msg_t(new_sock, &elec) > 0 && elec.type == ELECTION) {
                         printf("[ELECTION] Mn reconnecte — anneau referme, je suis M1\n");
+                        election_pending = 0;
                         if (sock_gauche >= 0) close(sock_gauche);
                         sock_gauche = new_sock;
                         /* Remplit mon port_s et diffuse table complète + token */
@@ -643,8 +647,10 @@ int main(int argc, char *argv[]) {
         /* ================================================================
            MESSAGES REÇUS DEPUIS L'ANNEAU (sock_gauche)
            Dispatcher selon msg.type — extraire en handle_ring_msg() si besoin
+           Note : FD_ISSET(-1) est UB → on verifie sock_gauche >= 0 d'abord
+           (peut etre -1 pendant une election M1 mort / repair en cours)
            ================================================================ */
-        if (FD_ISSET(sock_gauche, &readfds)) {
+        if (sock_gauche >= 0 && FD_ISSET(sock_gauche, &readfds)) {
             int n = recv_msg_t(sock_gauche, &msg);
             if (n <= 0) {
                 /* Déconnexion du voisin gauche.
@@ -676,6 +682,7 @@ int main(int argc, char *argv[]) {
                        -------------------------------------------------------- */
                     printf("[ELECTION] M1 (%d) mort — je deviens maitre\n", dead_port);
                     choix = 1;
+                    election_pending = 1;   /* bloque timeout token jusqu'au 'E' */
                     table_remove(table, &nb_machines, dead_port);
                     for (int i = 0; i < nb_machines; i++) {
                         table[i].is_master = (table[i].port == port_ecoute) ? 1 : 0;
@@ -1005,6 +1012,8 @@ int main(int argc, char *argv[]) {
                     printf("[MSG] Pour moi ! de %d: %s\n", msg.source, msg.data);
                     if (unix_client > 0) send_msg_t(unix_client, &msg);
                 } else {
+                    printf("[MSG] Pas pour moi (src=%d dest=%d) — je fais suivre\n",
+                           msg.source, msg.dest);
                     send_msg_t(sock_droite, &msg);
                 }
 
@@ -1039,6 +1048,10 @@ int main(int argc, char *argv[]) {
                                msg.source, msg.data, msg.size);
                     if (unix_client > 0) send_msg_t(unix_client, &msg);
                 } else {
+                    if (msg.type == FILE_START)
+                        printf("[FICHIER] Pas pour moi (src=%d dest=%d) — je fais suivre '%s'\n",
+                               msg.source, msg.dest, msg.data);
+                    /* FILE_DATA / FILE_END : forward silencieux (sinon spam) */
                     send_msg_t(sock_droite, &msg);
                 }
 
