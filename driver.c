@@ -819,14 +819,18 @@ int main(int argc, char *argv[]) {
 
                 } else if (has_pending) {
                     /* On a le token + un message Comm en attente : on envoie d'abord le message */
-                    /* Log avec hostname destination */
-                    const char *sh = "?", *si = "?";
-                    for (int i = 0; i < nb_machines; i++) {
-                        if (table[i].port == pending_msg.dest) {
-                            sh = table[i].hostname; si = table[i].ip; break;
+                    if (pending_msg.type == BROADCAST) {
+                        printf("[TOKEN] Envoi BROADCAST\n");
+                    } else {
+                        /* Log avec hostname destination */
+                        const char *sh = "?", *si = "?";
+                        for (int i = 0; i < nb_machines; i++) {
+                            if (table[i].port == pending_msg.dest) {
+                                sh = table[i].hostname; si = table[i].ip; break;
+                            }
                         }
+                        printf("[TOKEN] Envoi → %s (%s:%d)\n", sh, si, pending_msg.dest);
                     }
-                    printf("[TOKEN] Envoi → %s (%s:%d)\n", sh, si, pending_msg.dest);
                     send_msg_t(sock_droite, &pending_msg);
                     has_pending = 0;
                     sleep(2);
