@@ -508,17 +508,31 @@ int main(int argc, char *argv[]) {
                     /* Reconnexion LEAVE : M(n-1) devient le nouveau voisin gauche */
                     msg_t ldone;
                     if (recv_msg_t(new_sock, &ldone) > 0 && ldone.type == LEAVE_DONE) {
+                        int leaving_port = ldone.dest;
+                        /* Regarde (avant table_remove) si la machine qui part etait M1.
+                           Si oui : moi (M_next) je deviens le nouveau maitre. */
+                        int leaving_was_master = 0;
+                        for (int i = 0; i < nb_machines; i++) {
+                            if (table[i].port == leaving_port) {
+                                leaving_was_master = table[i].is_master; break;
+                            }
+                        }
                         printf("[LEAVE] Nouveau voisin gauche (port=%d)\n", ldone.source);
                         close(sock_gauche);
                         sock_gauche = new_sock;
-                        if (choix == 1) {
-                            /* M1 est M_next : traite directement sans passer par l'anneau */
-                            int leaving_port = ldone.dest;
+
+                        if (choix == 1 || leaving_was_master) {
+                            /* Je suis M1 (deja) OU je deviens M1 (M1 a quitte) */
+                            if (leaving_was_master && choix != 1) {
+                                printf("[LEAVE] M1 (%d) a quitte — je deviens le nouveau maitre\n",
+                                       leaving_port);
+                                choix = 1;
+                            }
                             table_remove(table, &nb_machines, leaving_port);
                             for (int i = 0; i < nb_machines; i++) {
-                                if (table[i].port == port_ecoute) {
-                                    table[i].port_s = port_voisin_droite; break;
-                                }
+                                table[i].is_master = (table[i].port == port_ecoute) ? 1 : 0;
+                                if (table[i].port == port_ecoute)
+                                    table[i].port_s = port_voisin_droite;
                             }
                             table_print(table, nb_machines);
                             printf("[LEAVE_DONE] Machine %d retiree\n", leaving_port);
@@ -535,7 +549,7 @@ int main(int argc, char *argv[]) {
                             printf("[TOKEN] Token relance apres depart (seq=%d)\n",
                                    token_seq);
                         } else {
-                            /* Non-M1 : forward LEAVE_DONE vers M1 via l'anneau */
+                            /* Non-M1 et M1 existe encore : forward LEAVE_DONE vers M1 */
                             send_msg_t(sock_droite, &ldone);
                         }
                     } else {
