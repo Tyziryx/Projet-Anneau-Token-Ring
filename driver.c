@@ -301,8 +301,14 @@ int main(int argc, char *argv[]) {
         /* Reconstruit le fd_set à chaque itération (select() le modifie) */
         FD_ZERO(&readfds);
 
-        FD_SET(sock_gauche, &readfds);
-        max_fd = sock_gauche;
+        /* sock_gauche peut être -1 pendant une élection (M1 vient de mourir)
+           FD_SET(-1) = UB en C → on le garde que s'il est valide */
+        if (sock_gauche >= 0) {
+            FD_SET(sock_gauche, &readfds);
+            max_fd = sock_gauche;
+        } else {
+            max_fd = 0;
+        }
 
         FD_SET(unix_listen, &readfds);
         if (unix_listen > max_fd) max_fd = unix_listen;
@@ -461,8 +467,21 @@ int main(int argc, char *argv[]) {
                 } else {
                     /* Stocke le message, sera envoyé quand le token passe */
                     has_pending = 1;
-                    printf("[UNIX] Message en attente du token (dest=%d)\n",
-                           pending_msg.dest);
+                    /* Log avec hostname de la destination (lookup dans table locale) */
+                    const char *dest_host = "?";
+                    const char *dest_ip   = "?";
+                    for (int i = 0; i < nb_machines; i++) {
+                        if (table[i].port == pending_msg.dest) {
+                            dest_host = table[i].hostname;
+                            dest_ip   = table[i].ip;
+                            break;
+                        }
+                    }
+                    if (pending_msg.type == BROADCAST)
+                        printf("[MSG] BROADCAST en attente du token\n");
+                    else
+                        printf("[MSG] → %s (%s:%d) — en attente du token\n",
+                               dest_host, dest_ip, pending_msg.dest);
                 }
             }
         }
@@ -779,8 +798,14 @@ int main(int argc, char *argv[]) {
 
                 } else if (has_pending) {
                     /* On a le token + un message Comm en attente : on envoie d'abord le message */
-                    printf("[TOKEN] Envoi msg (dest=%d) puis circulation\n",
-                           pending_msg.dest);
+                    /* Log avec hostname destination */
+                    const char *sh = "?", *si = "?";
+                    for (int i = 0; i < nb_machines; i++) {
+                        if (table[i].port == pending_msg.dest) {
+                            sh = table[i].hostname; si = table[i].ip; break;
+                        }
+                    }
+                    printf("[TOKEN] Envoi → %s (%s:%d)\n", sh, si, pending_msg.dest);
                     send_msg_t(sock_droite, &pending_msg);
                     has_pending = 0;
                     sleep(2);
