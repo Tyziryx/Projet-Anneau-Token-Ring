@@ -397,6 +397,17 @@ void handle_server_accept(void) {
             return;
         }
         join_port = ntohl(jport_net);
+
+        /* Verif : l'ID machine = port, donc un port deja pris casse la table */
+        for (int i = 0; i < nb_machines; i++) {
+            if (table[i].port == join_port) {
+                printf("[JOIN] Refuse — port %d deja utilise par %s (%s)\n",
+                       join_port, table[i].hostname, table[i].ip);
+                close(join_sock); join_sock = -1;
+                return;
+            }
+        }
+
         msg_t tmsg;
         tmsg.type   = TABLE_UPDATE;
         tmsg.source = port_ecoute;
