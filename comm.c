@@ -34,6 +34,83 @@
 #include "protocole.h"
 #include "utils.h"
 
+/* Etat de reception fichier — global pour etre partage entre on_file_* et main */
+static FILE *recv_file      = NULL;
+static char  recv_name[256] = {0};
+static long  recv_total     = 0;
+static long  recv_got       = 0;
+
+/* resout une IP saisie en port destination via la table locale
+   retourne -1 si IP inconnue (et affiche un message d'erreur) */
+int resolve_dest_port(machine_t *table, int nb, const char *dest_ip) {
+    for (int i = 0; i < nb; i++) {
+        if (strcmp(table[i].ip, dest_ip) == 0) return table[i].port;
+    }
+    printf("Erreur: IP '%s' inconnue (faites Recuperer d'abord)\n", dest_ip);
+    return -1;
+}
+
+/* envoie un fichier sur le socket driver : FILE_START + chunks FILE_DATA + FILE_END
+   inspire de transfer() du TD2 (transfer fichier client) */
+void send_file(int sock, int my_port, int dest, const char *filename) {
+    FILE *f = fopen(filename, "rb");
+    if (!f) { printf("Erreur: fichier '%s' introuvable\n", filename); return; }
+
+    fseek(f, 0, SEEK_END);
+    long fsz = ftell(f);
+    rewind(f);
+
+    /* FILE_START porte le nom dans data et la taille totale dans size */
+    msg_t fmsg = create_file_start(my_port, dest, filename);
+    fmsg.size  = (int)fsz;
+    send_msg_t(sock, &fmsg);
+
+    /* chunks FILE_DATA (max SMAX octets par envoi) */
+    char buf[SMAX];
+    int n, chunks = 0;
+    while ((n = (int)fread(buf, 1, SMAX, f)) > 0) {
+        fmsg = create_file_data(my_port, dest, buf, n);
+        send_msg_t(sock, &fmsg);
+        chunks++;
+    }
+    fclose(f);
+
+    fmsg = create_file_end(my_port, dest);
+    send_msg_t(sock, &fmsg);
+
+    printf("Transfert de '%s' lance (%ld octets, %d blocs, dest=%d)\n",
+           filename, fsz, chunks, dest);
+}
+
+/* handlers de reception fichier — appeles depuis la boucle main quand FILE_* arrive */
+void on_file_start(msg_t *msg) {
+    strncpy(recv_name, msg->data, sizeof(recv_name) - 1);
+    recv_total = msg->size;
+    recv_got   = 0;
+    recv_file  = fopen(recv_name, "wb");
+    if (!recv_file)
+        printf("\n[FICHIER] Impossible de creer '%s'\n", recv_name);
+    else
+        printf("\n[FICHIER] Reception de '%s' (%ld octets)...\n",
+               recv_name, recv_total);
+}
+
+void on_file_data(msg_t *msg) {
+    if (recv_file) {
+        fwrite(msg->data, 1, msg->size, recv_file);
+        recv_got += msg->size;
+    }
+}
+
+void on_file_end(void) {
+    if (recv_file) {
+        fclose(recv_file);
+        recv_file = NULL;
+        printf("\n[FICHIER] '%s' recu completement (%ld octets)\n",
+               recv_name, recv_got);
+    }
+}
+
 int main(int argc, char *argv[]) {
 
     int port;
@@ -97,14 +174,8 @@ int main(int argc, char *argv[]) {
     machine_t local_table[MAX_MACHINES];
     int local_nb = 0;
 
-    /* ------------------------------------------------------------------
-       Etat de réception de fichier (un seul transfert entrant à la fois)
-       Rempli par FILE_START, utilisé par FILE_DATA/FILE_END
-       ------------------------------------------------------------------ */
-    FILE *recv_file         = NULL;
-    char  recv_name[256]    = {0};
-    long  recv_total        = 0;
-    long  recv_got          = 0;
+    /* L'etat de reception fichier (recv_file/name/total/got) est en global,
+       voir le haut du fichier — manipule par on_file_start / on_file_data / on_file_end */
 
     printf("\n===== COMM ANNEAU (ID=%d) =====\n", port);
 
@@ -145,35 +216,15 @@ int main(int argc, char *argv[]) {
                 table_print(local_table, local_nb);
 
             /* ----------------------------------------------------------------
-               Transfert de fichier entrant (poussé par le driver quand dest==moi)
-               FILE_START : ouvre le fichier local en écriture
-               FILE_DATA  : écrit le chunk reçu
-               FILE_END   : ferme le fichier et confirme
+               Transfert de fichier entrant — handlers extraits en haut du fichier
+               (style transfer fichier TD : un on_file_start / data / end)
                ---------------------------------------------------------------- */
             } else if (msg.type == FILE_START) {
-                strncpy(recv_name, msg.data, sizeof(recv_name) - 1);
-                recv_total = msg.size;   /* taille totale mise dans FILE_START.size */
-                recv_got   = 0;
-                recv_file  = fopen(recv_name, "wb");
-                if (!recv_file)
-                    printf("\n[FICHIER] Impossible de creer '%s'\n", recv_name);
-                else
-                    printf("\n[FICHIER] Reception de '%s' (%ld octets)...\n",
-                           recv_name, recv_total);
-
+                on_file_start(&msg);
             } else if (msg.type == FILE_DATA) {
-                if (recv_file) {
-                    fwrite(msg.data, 1, msg.size, recv_file);
-                    recv_got += msg.size;
-                }
-
+                on_file_data(&msg);
             } else if (msg.type == FILE_END) {
-                if (recv_file) {
-                    fclose(recv_file);
-                    recv_file = NULL;
-                    printf("\n[FICHIER] '%s' recu completement (%ld octets)\n",
-                           recv_name, recv_got);
-                }
+                on_file_end();
             }
         }
 
@@ -201,18 +252,8 @@ int main(int argc, char *argv[]) {
                     char dest_ip[INET_ADDRSTRLEN];
                     printf("Destination (IP): ");
                     scanf("%s", dest_ip);
-                    /* Cherche le port correspondant dans la table locale */
-                    for (int i = 0; i < local_nb; i++) {
-                        if (strcmp(local_table[i].ip, dest_ip) == 0) {
-                            dest = local_table[i].port;
-                            break;
-                        }
-                    }
-                    if (dest == -1) {
-                        printf("Erreur: IP '%s' inconnue (faites Recuperer d'abord)\n",
-                               dest_ip);
-                        continue;
-                    }
+                    dest = resolve_dest_port(local_table, local_nb, dest_ip);
+                    if (dest == -1) continue;
                     printf("(port %d)\n", dest);
                 } else {
                     printf("Destination (port): ");
@@ -255,9 +296,8 @@ int main(int argc, char *argv[]) {
 
             } else if (choix == 4) {
                 /* --------------------------------------------------------
-                   Transferer un fichier — envoie FILE_START + chunks + FILE_END
+                   Transferer un fichier — delegue a send_file() en haut du fichier
                    Le driver tient le token pendant tout le transfert (Token Ring)
-                   msg.size dans FILE_START = taille totale du fichier
                    -------------------------------------------------------- */
                 int dest = -1;
                 char filename[256];
@@ -266,17 +306,8 @@ int main(int argc, char *argv[]) {
                     char dest_ip[INET_ADDRSTRLEN];
                     printf("Destination (IP): ");
                     scanf("%s", dest_ip);
-                    for (int i = 0; i < local_nb; i++) {
-                        if (strcmp(local_table[i].ip, dest_ip) == 0) {
-                            dest = local_table[i].port;
-                            break;
-                        }
-                    }
-                    if (dest == -1) {
-                        printf("Erreur: IP '%s' inconnue (faites Recuperer d'abord)\n",
-                               dest_ip);
-                        continue;
-                    }
+                    dest = resolve_dest_port(local_table, local_nb, dest_ip);
+                    if (dest == -1) continue;
                     printf("(port %d)\n", dest);
                 } else {
                     printf("Destination (port): ");
@@ -285,38 +316,7 @@ int main(int argc, char *argv[]) {
                 printf("Fichier a envoyer: ");
                 scanf(" %255s", filename);
 
-                FILE *f = fopen(filename, "rb");
-                if (!f) {
-                    printf("Erreur: fichier '%s' introuvable\n", filename);
-                    continue;
-                }
-
-                /* Calcule la taille du fichier */
-                fseek(f, 0, SEEK_END);
-                long fsz = ftell(f);
-                rewind(f);
-
-                /* FILE_START : filename dans data, taille totale dans msg.size */
-                msg_t fmsg = create_file_start(port, dest, filename);
-                fmsg.size = (int)fsz;
-                send_msg_t(sock, &fmsg);
-
-                /* Envoie les chunks FILE_DATA (taille max SMAX par chunk) */
-                char buf[SMAX];
-                int n, chunks = 0;
-                while ((n = (int)fread(buf, 1, SMAX, f)) > 0) {
-                    fmsg = create_file_data(port, dest, buf, n);
-                    send_msg_t(sock, &fmsg);
-                    chunks++;
-                }
-                fclose(f);
-
-                /* FILE_END : signale la fin du transfert */
-                fmsg = create_file_end(port, dest);
-                send_msg_t(sock, &fmsg);
-
-                printf("Transfert de '%s' lance (%ld octets, %d blocs, dest=%d)\n",
-                       filename, fsz, chunks, dest);
+                send_file(sock, port, dest, filename);
 
             } else if (choix == 5) {
                 /* --------------------------------------------------------
