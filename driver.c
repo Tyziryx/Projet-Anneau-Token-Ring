@@ -144,23 +144,36 @@ void init_as_M1(void) {
         scanf("%d", &port_ecoute);
     }
 
-    printf("En attente du premier voisin...\n");
-    struct sockaddr_in cli;
-    socklen_t lg = sizeof(cli);
-    sock_gauche = accept(server_sock, (struct sockaddr *)&cli, &lg);
-    if (sock_gauche < 0) FATAL("accept");
-
     int port_m2;
     char hostname_m2[HOSTNAME_LEN];
-    char iflag;
-    if (recv_all(sock_gauche, &iflag, 1) <= 0) FATAL("recv flag init");
-    if (recv_all(sock_gauche, (char *)&port_m2, sizeof(int)) <= 0) FATAL("recv port_m2");
-    port_m2 = ntohl(port_m2);
-    if (recv_all(sock_gauche, hostname_m2, HOSTNAME_LEN) <= 0) FATAL("recv hostname_m2");
-
     char ip_m2[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &cli.sin_addr, ip_m2, sizeof(ip_m2));
-    printf("Connexion recue de %s (%s:%d)\n", hostname_m2, ip_m2, port_m2);
+    struct sockaddr_in cli;
+    socklen_t lg;
+
+    /* Boucle : refuse les voisins qui prennent le meme port que moi (ID = port) */
+    while (1) {
+        printf("En attente du premier voisin...\n");
+        lg = sizeof(cli);
+        sock_gauche = accept(server_sock, (struct sockaddr *)&cli, &lg);
+        if (sock_gauche < 0) FATAL("accept");
+
+        char iflag;
+        if (recv_all(sock_gauche, &iflag, 1) <= 0) FATAL("recv flag init");
+        if (recv_all(sock_gauche, (char *)&port_m2, sizeof(int)) <= 0) FATAL("recv port_m2");
+        port_m2 = ntohl(port_m2);
+        if (recv_all(sock_gauche, hostname_m2, HOSTNAME_LEN) <= 0) FATAL("recv hostname_m2");
+
+        inet_ntop(AF_INET, &cli.sin_addr, ip_m2, sizeof(ip_m2));
+
+        if (port_m2 == port_ecoute) {
+            printf("[JOIN] Refuse — %s (%s) utilise mon port %d (l'ID doit etre unique)\n",
+                   hostname_m2, ip_m2, port_m2);
+            close(sock_gauche);
+            continue;
+        }
+        printf("Connexion recue de %s (%s:%d)\n", hostname_m2, ip_m2, port_m2);
+        break;
+    }
 
     msg_t tmsg;
     tmsg.type   = TABLE_UPDATE;
